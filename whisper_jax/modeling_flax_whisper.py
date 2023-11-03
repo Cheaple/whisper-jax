@@ -1533,6 +1533,7 @@ class FlaxWhisperForConditionalGeneration(FlaxWhisperPreTrainedModel):
         task=None,
         language=None,
         is_multilingual=None,
+        prompt_ids=None,
         **kwargs,
     ):
         if generation_config is None:
@@ -1567,6 +1568,36 @@ class FlaxWhisperForConditionalGeneration(FlaxWhisperPreTrainedModel):
                 forced_decoder_ids.append((2, generation_config.task_to_id[generation_config.task]))
             else:
                 forced_decoder_ids.append((2, generation_config.task_to_id["transcribe"]))
+        
+        # Add prompt functionality
+        if prompt_ids is not None:
+            if kwargs.get("decoder_start_token_id") is not None:
+                raise ValueError(
+                    "When specifying `prompt_ids`, you cannot also specify `decoder_start_token_id` as it gets overwritten."
+                )
+            prompt_ids = prompt_ids.tolist()
+            start_prompt_token_id, *text_prompt_ids = prompt_ids
+            # Set the decoder_start_token_id to <|startofprev|>
+            kwargs.update({"decoder_start_token_id": start_prompt_token_id})
+
+            # Update the max generation length to include the prompt
+            specified_max_length = kwargs.pop("max_new_tokens", None) or kwargs.pop("max_length", None)
+            default_max_length = generation_config.max_new_tokens or generation_config.max_length
+            non_prompt_max_length = specified_max_length or default_max_length
+            kwargs["max_new_tokens"] = non_prompt_max_length + len(text_prompt_ids)
+
+            # Reformat the forced_decoder_ids to incorporate the prompt
+            forced_decoder_ids = [
+                # Slicing the text prompt ids in a manner consistent with the OpenAI implementation
+                # to accomodate context space for the prefix (see https://github.com/openai/whisper/blob/c09a7ae299c4c34c5839a76380ae407e7d785914/whisper/decoding.py#L599)
+                *text_prompt_ids[-self.model.config.max_length // 2 - 1 :],
+                generation_config.decoder_start_token_id,
+                *[token for _rank, token in forced_decoder_ids],
+            ]
+            forced_decoder_ids = [(rank + 1, token) for rank, token in enumerate(forced_decoder_ids)]            
+            generation_config.decoder_start_token_id = start_prompt_token_id
+            generation_config.forced_decoder_ids = forced_decoder_ids
+        # End prompt functionality
 
         if (
             hasattr(generation_config, "return_timestamps") and generation_config.return_timestamps
@@ -1574,10 +1605,6 @@ class FlaxWhisperForConditionalGeneration(FlaxWhisperPreTrainedModel):
             logits_processor = [
                 FlaxWhisperTimeStampLogitsProcessor(generation_config, self.config, decoder_input_length)
             ]
-        else:
-            if forced_decoder_ids and forced_decoder_ids[-1][0] != generation_config.no_timestamps_token_id:
-                idx = forced_decoder_ids[-1][0] + 1 if forced_decoder_ids else 1
-                forced_decoder_ids.append((idx, generation_config.no_timestamps_token_id))
 
         if len(forced_decoder_ids) > 0:
             generation_config.forced_decoder_ids = forced_decoder_ids
@@ -1601,10 +1628,10 @@ class FlaxWhisperForConditionalGeneration(FlaxWhisperPreTrainedModel):
             generation_config = self.generation_config
 
         # override the generation config forced decoder ids in preference of the ones we have set
-        generation_config.forced_decoder_ids = None
+        # for init prompt, do not override
+        # generation_config.forced_decoder_ids = None
 
         logits_processor = FlaxLogitsProcessorList()
-
         logits_processor.append(FlaxStaticForceTokensLogitsProcessor(forced_decoder_ids))
 
         if hasattr(generation_config, "return_timestamps") and return_timestamps:
@@ -1668,7 +1695,8 @@ FLAX_WHISPER_CONDITIONAL_GENERATION_DOCSTRING = r"""
     >>> ds = load_dataset("hf-internal-testing/librispeech_asr_dummy", "clean", split="validation")
     >>> inputs = processor(ds[0]["audio"]["array"], return_tensors="np")
     >>> input_features = inputs.input_features
-    >>> generated_ids = model.generate(input_ids=input_features)
+    >>> generated_ids = model.generate(input_ids=input_features) # Without prompt 
+    >>> generated_ids = model.generate(input_ids=input_features, prompt_ids=processor.get_prompt_ids("PromptText")) # With prompt 
     >>> transcription = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
     >>> transcription
     ' Mr. Quilter is the apostle of the middle classes, and we are glad to welcome his gospel.'

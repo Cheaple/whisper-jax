@@ -179,10 +179,12 @@ class FlaxWhisperPipline:
             static_argnums=(3,),
         )
 
-    def generate(self, input_features, language=None, task=None, return_timestamps=False):
+    def generate(self, input_features, language=None, task=None, return_timestamps=False, prompt_ids=None):
         forced_decoder_ids = self.get_forced_decoder_ids(
-            language=language, task=task, return_timestamps=return_timestamps
+            language=language, task=task, return_timestamps=return_timestamps, prompt_ids=prompt_ids
         )
+        print("generate() forced_decoder_ids: ", forced_decoder_ids)
+        print("generate() forced_decoder_ids: ", self.processor.tokenizer.decode([token for idx, token in forced_decoder_ids], skip_special_tokens=False))
         if not self.is_sharded:
             # if we're using pmap we need to manually replicate the input data across devices and gather the output tokens
             output_ids = self.p_generate(
@@ -194,9 +196,19 @@ class FlaxWhisperPipline:
             output_ids = self.p_generate(
                 freeze(self.params), input_features, forced_decoder_ids, return_timestamps
             ).sequences
+        print("generate() output_ids: ", output_ids[0][:20])
+        print("generate() output_ids: ", self.processor.tokenizer.decode(output_ids[0][:20]))
+        print()
         return output_ids
 
-    def get_forced_decoder_ids(self, generation_config=None, task=None, language=None, return_timestamps=False):
+    def get_forced_decoder_ids(
+        self, 
+        generation_config=None, 
+        task=None, 
+        language=None,
+        return_timestamps=False,
+        prompt_ids=None
+    ):
         if generation_config is None:
             generation_config = self.model.generation_config
 
@@ -230,17 +242,39 @@ class FlaxWhisperPipline:
                         f"Unsupported language: {language}. Language should be one of:" f" {acceptable_languages}."
                     )
                 forced_decoder_ids.append((1, generation_config.lang_to_id[language_token]))
+            else:
+                forced_decoder_ids.append((1, -1))  # no language specified
 
             if task is not None:
                 forced_decoder_ids.append((2, generation_config.task_to_id[task]))
             else:
                 forced_decoder_ids.append((2, generation_config.task_to_id["transcribe"]))
 
+        # initial prompts
+        if prompt_ids is not None:
+            prompt_ids = prompt_ids.tolist()
+            start_prompt_token_id, *text_prompt_ids = prompt_ids    
+            
+            # Reformat the forced_decoder_ids to incorporate the prompt
+            forced_decoder_ids = [
+                # Slicing the text prompt ids in a manner consistent with the OpenAI implementation
+                # to accomodate context space for the prefix (see https://github.com/openai/whisper/blob/c09a7ae299c4c34c5839a76380ae407e7d785914/whisper/decoding.py#L599)
+                *text_prompt_ids[-self.model.config.max_length // 2 - 1 :],
+                generation_config.decoder_start_token_id,
+                *[token for _rank, token in forced_decoder_ids],
+            ]
+            forced_decoder_ids = [(rank + 1, token) for rank, token in enumerate(forced_decoder_ids)]            
+            generation_config.decoder_start_token_id = start_prompt_token_id
+            generation_config.forced_decoder_ids = forced_decoder_ids
+
         if not return_timestamps:
             if forced_decoder_ids and forced_decoder_ids[-1][0] != generation_config.no_timestamps_token_id:
                 idx = forced_decoder_ids[-1][0] + 1 if forced_decoder_ids else 1
                 forced_decoder_ids.append((idx, generation_config.no_timestamps_token_id))
-
+        
+        print("get_forced_decoder_ids() forced_decoder_ids: ", forced_decoder_ids)
+        print("get_forced_decoder_ids() forced_decoder_ids: ", self.processor.tokenizer.decode([token for idx, token in forced_decoder_ids], skip_special_tokens=False))
+        print()
         return forced_decoder_ids
 
     def chunk_iter_with_batch(self, inputs, chunk_len, stride_left, stride_right, batch_size):
@@ -396,7 +430,7 @@ class FlaxWhisperPipline:
         )
         return {"text": text, **optional}
 
-    def forward(self, model_inputs, batch_size=None, language=None, task=None, return_timestamps=False):
+    def forward(self, model_inputs, batch_size=None, language=None, task=None, return_timestamps=False, prompt_ids=None):
         # We need to keep track of some additional input arguments for post-processing so need to forward these on after running generation
         input_features = model_inputs.pop("input_features")
         input_batch_size = input_features.shape[0]
@@ -405,13 +439,16 @@ class FlaxWhisperPipline:
             padding = np.zeros([batch_size - input_batch_size, *input_features.shape[1:]], input_features.dtype)
             input_features = np.concatenate([input_features, padding])
 
-        pred_ids = self.generate(input_features, language=language, task=task, return_timestamps=return_timestamps)[
+        pred_ids = self.generate(input_features, language=language, task=task, return_timestamps=return_timestamps, prompt_ids=prompt_ids)[
             :input_batch_size
         ]
+        print("forward() pred_ids: ", self.processor.tokenizer.decode(pred_ids[0]))
+
+        # TODO: remove prompt ids from pred_ids
 
         # tokenizer's decode method expects an extra dim - we insert it here for convenience
         out = {"tokens": pred_ids[:, None, :]}
-
+        
         stride = model_inputs.pop("stride", None)
         if stride is not None:
             out["stride"] = stride
@@ -427,6 +464,7 @@ class FlaxWhisperPipline:
         language=None,
         task=None,
         return_timestamps=None,
+        prompt=None,
         generate_kwargs=None,
     ):
         """
@@ -448,6 +486,7 @@ class FlaxWhisperPipline:
                        ask the pipeline to treat the first `left` samples and last `right` samples to be ignored in
                        decoding (but used at inference to provide more context to the model). In general, this additional
                        stride argument is not required.
+
             chunk_length_s (`float`, *optional*, defaults to 30.0):
                 The input length for each chunk. If `chunk_length_s = 0` then chunking is disabled. By default, the chunk
                 length is set 30.0s, equal to Whisper's context window.
@@ -474,6 +513,8 @@ class FlaxWhisperPipline:
                 Whether to return timestamps in the prediction. Defaults to False. If set to true, the pipeline
                 will return two keys in the output dictionary: `"text"` containing the text transcription, and `"chunks"`
                 containing the transcription segments chunked by their utterance-level timestamps.
+            prompt (`str`, *optional*, defaults to None):
+                Initial prompt string.
 
         Return:
             `Dict`: A dictionary with the following keys:
@@ -493,12 +534,13 @@ class FlaxWhisperPipline:
         dataloader = self.preprocess_batch(
             inputs, chunk_length_s=chunk_length_s, stride_length_s=stride_length_s, batch_size=batch_size
         )
+        prompt_ids = self.processor.get_prompt_ids(prompt) if prompt is not None else None
         model_outputs = []
         # iterate over our chunked audio samples
         for batch in dataloader:
             model_outputs.append(
                 self.forward(
-                    batch, batch_size=batch_size, language=language, task=task, return_timestamps=return_timestamps
+                    batch, prompt_ids=prompt_ids, batch_size=batch_size, language=language, task=task, return_timestamps=return_timestamps
                 )
             )
         post_processed = self.postprocess(model_outputs, return_timestamps=return_timestamps)
