@@ -418,7 +418,7 @@ class FlaxWhisperAttention(nn.Module):
             # we feed one position at a time.
             one_token_key = jnp.moveaxis(key, -3, -1)
             one_token_value = jnp.moveaxis(value, -3, -1)
-
+            
             # Update key, value caches with our new 1d spatial slices.
             # We implement an efficient scatter into the cache via one-hot
             # broadcast and addition.
@@ -1590,7 +1590,7 @@ class FlaxWhisperForConditionalGeneration(FlaxWhisperPreTrainedModel):
             forced_decoder_ids = [
                 # Slicing the text prompt ids in a manner consistent with the OpenAI implementation
                 # to accomodate context space for the prefix (see https://github.com/openai/whisper/blob/c09a7ae299c4c34c5839a76380ae407e7d785914/whisper/decoding.py#L599)
-                *text_prompt_ids[-self.model.config.max_length // 2 - 1 :],
+                *text_prompt_ids[-self.model.config.max_target_positions // 2 - 1 :],
                 generation_config.decoder_start_token_id,
                 *[token for _rank, token in forced_decoder_ids],
             ]
@@ -1635,8 +1635,12 @@ class FlaxWhisperForConditionalGeneration(FlaxWhisperPreTrainedModel):
         logits_processor.append(FlaxStaticForceTokensLogitsProcessor(forced_decoder_ids))
 
         if hasattr(generation_config, "return_timestamps") and return_timestamps:
-            logits_processor.append(FlaxWhisperTimeStampLogitsProcessor(generation_config, self.config, 1))
-
+            # jax.debug.print("{x}", x=[rank for rank, token in forced_decoder_ids])
+            print("pipeline FlaxWhisperTimeStampLogitsProcessor() decoder_input_length: ", len(forced_decoder_ids) - 1)
+            logits_processor.append(FlaxWhisperTimeStampLogitsProcessor(generation_config, self.config, len(forced_decoder_ids) - 1))
+        # print("pipeline generate() kwargs: ", kwargs)
+        print("pipeline_generate() generation_config: ", generation_config)
+        print("pipeline_generate() input_features: ", input_features)
         return super().generate(
             input_features,
             generation_config,

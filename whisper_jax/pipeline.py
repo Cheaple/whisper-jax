@@ -196,9 +196,6 @@ class FlaxWhisperPipline:
             output_ids = self.p_generate(
                 freeze(self.params), input_features, forced_decoder_ids, return_timestamps
             ).sequences
-        print("generate() output_ids: ", output_ids[0][:20])
-        print("generate() output_ids: ", self.processor.tokenizer.decode(output_ids[0][:20]))
-        print()
         return output_ids
 
     def get_forced_decoder_ids(
@@ -253,19 +250,24 @@ class FlaxWhisperPipline:
         # initial prompts
         if prompt_ids is not None:
             prompt_ids = prompt_ids.tolist()
-            start_prompt_token_id, *text_prompt_ids = prompt_ids    
+            start_prompt_token_id, *text_prompt_ids = prompt_ids
             
             # Reformat the forced_decoder_ids to incorporate the prompt
             forced_decoder_ids = [
+                # start_prompt_token_id,
                 # Slicing the text prompt ids in a manner consistent with the OpenAI implementation
                 # to accomodate context space for the prefix (see https://github.com/openai/whisper/blob/c09a7ae299c4c34c5839a76380ae407e7d785914/whisper/decoding.py#L599)
-                *text_prompt_ids[-self.model.config.max_length // 2 - 1 :],
+                *text_prompt_ids[-self.model.config.max_target_positions // 2 - 1 :],
                 generation_config.decoder_start_token_id,
                 *[token for _rank, token in forced_decoder_ids],
             ]
-            forced_decoder_ids = [(rank + 1, token) for rank, token in enumerate(forced_decoder_ids)]            
+            forced_decoder_ids = [(rank + 1, token) for rank, token in enumerate(forced_decoder_ids)]
             generation_config.decoder_start_token_id = start_prompt_token_id
+            
+            # Set the decoder_start_token_id to <|startofprev|>       
             generation_config.forced_decoder_ids = forced_decoder_ids
+            generation_config.max_length += len(prompt_ids)
+            # self.max_length = generation_config.max_length
 
         if not return_timestamps:
             if forced_decoder_ids and forced_decoder_ids[-1][0] != generation_config.no_timestamps_token_id:
@@ -442,9 +444,23 @@ class FlaxWhisperPipline:
         pred_ids = self.generate(input_features, language=language, task=task, return_timestamps=return_timestamps, prompt_ids=prompt_ids)[
             :input_batch_size
         ]
-        print("forward() pred_ids: ", self.processor.tokenizer.decode(pred_ids[0]))
+        print("forward() pred_ids[0]: ", self.processor.tokenizer.decode(pred_ids[0]))
+        print("forward() pred_ids[1]: ", self.processor.tokenizer.decode(pred_ids[1]))
+        print("forward() pred_ids[2]: ", self.processor.tokenizer.decode(pred_ids[2]))
+        print("forward() pred_ids[3]: ", self.processor.tokenizer.decode(pred_ids[3]))
+        print("forward() pred_ids[4]: ", self.processor.tokenizer.decode(pred_ids[4]))
+        print("forward() pred_ids[5]: ", self.processor.tokenizer.decode(pred_ids[5]))
+        # print("forward() pred_ids[6]: ", self.processor.tokenizer.decode(pred_ids[6]))
+        print("pred_ids size ", pred_ids.shape, ":\n ", pred_ids)
 
-        # TODO: remove prompt ids from pred_ids
+        # remove prompt token ids, to avoid text conflicts when decoding
+        # similer function are implement in the tokenizer._preprocess_token_ids() methods
+        if prompt_ids is not None:
+            tmp = np.full(pred_ids.shape, self.model.generation_config.pad_token_id)  # fill paddings with <|endoftext|> tokens
+            pred_ids = pred_ids[:, len(prompt_ids):]
+            tmp[:pred_ids.shape[0], :pred_ids.shape[1]] = pred_ids
+            pred_ids = tmp
+            print("pred_ids size ", pred_ids.shape, ":\n ", pred_ids)
 
         # tokenizer's decode method expects an extra dim - we insert it here for convenience
         out = {"tokens": pred_ids[:, None, :]}
